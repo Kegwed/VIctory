@@ -557,8 +557,70 @@ impl HostPipeline {
     }
 }
 
+/// A pipeline-state stream subobject: its type, then its description,
+/// pointer-aligned.
+#[repr(C, align(8))]
+struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+
+/// A mesh pipeline's description in stream form (no input layout).
+#[repr(C)]
+struct MeshStream {
+    root: Sub<*mut std::ffi::c_void>,
+    ms: Sub<D3D12_SHADER_BYTECODE>,
+    ps: Sub<D3D12_SHADER_BYTECODE>,
+    blend: Sub<D3D12_BLEND_DESC>,
+    mask: Sub<u32>,
+    raster: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
+    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+    dsv: Sub<DXGI_FORMAT>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+impl MeshStream {
+    fn new(
+        root: *mut std::ffi::c_void,
+        ms: D3D12_SHADER_BYTECODE,
+        ps: D3D12_SHADER_BYTECODE,
+        g: &GraphicsState,
+    ) -> Self {
+        MeshStream {
+            root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root),
+            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            mask: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                g.sample_mask,
+            ),
+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+            depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+            targets: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                g.targets,
+            ),
+            dsv: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                g.depth_format,
+            ),
+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+            // The pipeline library never loads back a mesh pipeline whose
+            // topology is undefined (left out of the stream or given):
+            // `LoadPipeline` with the very stream it was created and stored
+            // from reports a different description, so every mesh pipeline
+            // was compiled again on every run (#780). Any defined topology
+            // loads; translated mesh shaders always output triangles.
+            topology: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ),
+        }
+    }
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
-/// stream form (no input layout or topology).
+/// stream form.
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -568,36 +630,9 @@ fn mesh_pipeline(
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
-    /// A stream subobject: its type, then its description, pointer-aligned.
-    #[repr(C, align(8))]
-    struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
-    #[repr(C)]
-    struct Stream {
-        root: Sub<*mut std::ffi::c_void>,
-        ms: Sub<D3D12_SHADER_BYTECODE>,
-        ps: Sub<D3D12_SHADER_BYTECODE>,
-        blend: Sub<D3D12_BLEND_DESC>,
-        mask: Sub<u32>,
-        raster: Sub<D3D12_RASTERIZER_DESC>,
-        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
-        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-        dsv: Sub<DXGI_FORMAT>,
-        samples: Sub<DXGI_SAMPLE_DESC>,
-    }
-    let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
-        ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
-        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-    };
+    let mut stream = MeshStream::new(root.as_raw(), ms, ps, g);
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of::<Stream>(),
+        SizeInBytes: size_of::<MeshStream>(),
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
     };
     let device = device.cast::<ID3D12Device2>()?;
@@ -663,5 +698,25 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mesh stream names a triangle topology: with none, the pipeline
+    /// library refuses to load back what it stored (#780).
+    #[test]
+    fn mesh_stream_names_a_topology() {
+        let code = D3D12_SHADER_BYTECODE::default();
+        let s = MeshStream::new(std::ptr::null_mut(), code, code, &GraphicsState::default());
+        assert_eq!(
+            s.topology.0,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY
+        );
+        assert_eq!(s.topology.1, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        // The stream is whole subobjects back to back.
+        assert_eq!(size_of::<MeshStream>() % 8, 0);
     }
 }
